@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-# メイン画面中心UI + 権限ベースのテーブル/ビュー自動フィルタ（SHOW未使用） + 体感性能改善版
-# 方針：
-#  - Information Schema だけで権限を解決（ENABLED_ROLES / OBJECT_PRIVILEGES）
-#  - ビューを含める、ロール継承を含む、ALLOWED_TABLESは使わない
-#  - UIは「コマンドバー + タブ + 2カラム（設定/結果）」で一画面完結
-#  - 当面は TEST_DB.TEST 固定。将来は TARGETS を増やすだけで拡張可能。
+# UI改善版 (v3)
+# - タブ①（フィルタ）とタブ②（結合）を「SQLビルダー」タブに統合
+# - SQL保存機能、S3アップロード機能を削除し、UIを簡素化
+# - 操作フロー: [Step 1: テーブル定義] -> [Step 2: 条件指定] -> [Step 3: 実行]
+# - フィルタ条件を動的に追加・削除できるUIに変更
+# - フィルタUIのラベルを非表示化
+# - (v3) フィルタ条件フォームを横並びに変更
+# - (v3) 結合ステップの削除ボタンを右端に配置
+# - (v3) SELECT句もst.expanderで囲む
 
 import streamlit as st
 import pandas as pd
@@ -57,13 +60,34 @@ TARGETS = [
 # -------------------------------------------------
 # 定数
 # -------------------------------------------------
-DELIMITER_COMMA = ','
-DELIMITER_TAB = '\t'
-STAGE_NAME = '@test_s3_stage'
-S3_DirName = '/test/'
-S3_FileName = 'testfilename'
 CSV_MAX = 50000   # CSV/TSV のZIP分割行数
 EXCEL_MAX = 50000 # Excelの最大行数
+
+# -------------------------------------------------
+# セッションステート初期化
+# -------------------------------------------------
+# SQLビルダータブの状態
+if "builder_base_table" not in st.session_state:
+    st.session_state.builder_base_table = ""
+if "builder_join_steps" not in st.session_state:
+    st.session_state.builder_join_steps = []
+if "builder_available_columns" not in st.session_state:
+    # (例: [{"fq_name": "TBL.COL", "table": "TBL", "column": "COL", "dtype": "VARCHAR"}, ...])
+    st.session_state.builder_available_columns = []
+if "builder_where_conditions" not in st.session_state: # 動的フィルタ用
+    # (例: [{"id": 1, "column": "TBL.COL", "operator": "=", "value": "abc"}, ...])
+    st.session_state.builder_where_conditions = []
+if "builder_where_next_id" not in st.session_state: # 動的フィルタ用
+    st.session_state.builder_where_next_id = 0
+if "builder_selected_columns" not in st.session_state:
+    st.session_state.builder_selected_columns = []
+if "builder_sql" not in st.session_state:
+    st.session_state.builder_sql = ""
+if "builder_df_preview" not in st.session_state:
+    st.session_state.builder_df_preview = pd.DataFrame()
+if "builder_df_for_download" not in st.session_state:
+    st.session_state.builder_df_for_download = pd.DataFrame()
+
 
 # -------------------------------------------------
 # 接続・共通クエリ関数
@@ -71,17 +95,6 @@ EXCEL_MAX = 50000 # Excelの最大行数
 @st.cache_resource
 def get_conn():
     """Snowflake接続をセッション内で再利用"""
-    # 必要に応じて接続パラメータを指定してください
-    # 例:
-    # return snowflake.connector.connect(
-    #     account="xxx",
-    #     user="xxx",
-    #     password="xxx",
-    #     warehouse="xxx",
-    #     role="xxx",
-    #     database="xxx",
-    #     schema="xxx",
-    # )
     return snowflake.connector.connect()
 
 def _normalize_params(params):
@@ -189,10 +202,29 @@ def get_allowed_tables() -> list[str]:
             include_views=True, include_materialized_views=False
         )
         all_effective.update(objs)
-    return sorted(all_effective)
+    return sorted(list(all_effective))
+
+@st.cache_data(ttl=300)
+def get_columns_for_table(target_db: str, target_schema: str, table_name: str) -> list[dict]:
+    """指定されたテーブルのカラム情報（名前、型）を取得"""
+    tname = sanitize_ident(table_name)
+    target_db = sanitize_ident(target_db)
+    target_schema = sanitize_ident(target_schema)
+    if not tname:
+        return []
+    
+    df_columns = run_query(f"""
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM {target_db}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{tname}'
+        ORDER BY ORDINAL_POSITION
+    """)
+    # 辞書のリストとして返す
+    return df_columns.to_dict('records')
+
 
 # -------------------------------------------------
-# ダウンロード / S3 / ストリーミング
+# ダウンロード / ストリーミング
 # -------------------------------------------------
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
@@ -260,29 +292,13 @@ def stream_query_to_zip(sql: str, sep: str = ",", quotechar: str = '"', split_li
                     written += 1
             if written == 0:
                 zf.writestr("part1.csv", out.getvalue().encode("utf-8"))
-            else:
+            elif out.tell() > 0: # 最後のバッチを書き込む
                 zf.writestr(f"part{part_no}.csv", out.getvalue().encode("utf-8"))
     buf.seek(0)
     return buf
 
-def S3_upload(query: str, delimiter: str, filename: str):
-    with st.spinner("S3アップロード中..."):
-        run_query(f"""
-COPY INTO {STAGE_NAME}{S3_DirName}{S3_FileName}{filename}
-FROM ({query})
-FILE_FORMAT = (
-  TYPE = CSV
-  FIELD_DELIMITER = '{delimiter}'
-  FIELD_OPTIONALLY_ENCLOSED_BY = '\"'
-  COMPRESSION = GZIP
-  HEADER = TRUE
-)
-OVERWRITE = TRUE
-SINGLE = TRUE;
-""")
-    st.success("S3アップロード完了しました")
-
-def show_download_ui(df: pd.DataFrame, table_name: str, key_prefix: str = "download"):
+def show_download_ui(df: pd.DataFrame, file_name_prefix: str, key_prefix: str = "download"):
+    """ダウンロードUI（DataFrame準備済み用）"""
     if df.empty:
         st.warning("ダウンロード可能なデータがありません。")
         return
@@ -293,12 +309,14 @@ def show_download_ui(df: pd.DataFrame, table_name: str, key_prefix: str = "downl
     with col2:
         ft = st.selectbox("形式", ["csv", "tsv", "excel"], index=0, key=f"{key_prefix}_fmt")
     with col3:
+        st.write("") # ボタンを中央揃えにするためのダミー
+        st.write("")
         if ft in ("csv","tsv"):
             data = generate_download(df, filetype=ft, quote_option=quote_option)
             st.download_button(
                 label="📥 ZIPダウンロード",
                 data=data,
-                file_name=f"{table_name}_{today_str}_{ft.upper()}.zip",
+                file_name=f"{file_name_prefix}_{today_str}_{ft.upper()}.zip",
                 mime="application/zip",
                 key=f"{key_prefix}_dlzip"
             )
@@ -308,33 +326,54 @@ def show_download_ui(df: pd.DataFrame, table_name: str, key_prefix: str = "downl
                 st.download_button(
                     label="📥 Excelダウンロード",
                     data=data,
-                    file_name=f"{table_name}_{today_str}.xlsx",
+                    file_name=f"{file_name_prefix}_{today_str}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"{key_prefix}_xldl"
                 )
             else:
-                st.warning("Excelは50,000件を超えるためダウンロードできません。")
+                st.warning(f"Excelは{EXCEL_MAX}件を超えるためダウンロードできません。")
 
-def download_ready_ui(df_preview: pd.DataFrame, table_name: str, sql_all_func):
+def download_ready_ui(df_preview: pd.DataFrame, table_name: str, sql_all_func, sql_query: str):
     """
     従来の「全件をDFに積んでからDL」＋ 高速ストリーミングDL（DF不要）の両対応。
+    （S3機能は削除）
     """
     if df_preview.empty:
         st.warning("ダウンロード可能なデータがありません。")
         return
-    colA, colB, colC = st.columns([1.2, 1.2, 2])
+        
+    st.markdown("**ダウンロード**")
+    colA, colB = st.columns(2)
+    
     with colA:
+        st.caption("A: 全件取得してからダウンロード")
         if st.button("📥 ダウンロード準備（全件取得）"):
             with st.spinner("全件データを取得中..."):
-                st.session_state.df_for_download = sql_all_func()
-            st.success(f"全件データを取得しました ({len(st.session_state.df_for_download)}件)")
+                st.session_state.builder_df_for_download = sql_all_func()
+            st.success(f"全件データを取得しました ({len(st.session_state.builder_df_for_download)}件)")
+        
+        # 全件DFが準備できたらDLボタンを表示
+        if not st.session_state.builder_df_for_download.empty:
+            show_download_ui(
+                st.session_state.builder_df_for_download,
+                file_name_prefix=table_name,
+                key_prefix="builder_dl_full"
+            )
+
     with colB:
+        st.caption("B: 高速ストリーミング（大容量向け）")
         sep_choice = st.radio("区切り", ["CSV", "TSV"], horizontal=True, key="fast_sep")
         sep = "\t" if sep_choice == "TSV" else ","
         quote_option = st.selectbox("囲い文字", ['"', "'"], index=0, key="fast_quote")
+        
         if st.button("📥 高速ZIPダウンロード（ストリーミング）"):
+            if not sql_query:
+                st.error("実行対象のSQLがありません。")
+                return
+
             with st.spinner("ZIP生成中..."):
-                data = stream_query_to_zip(st.session_state.get("last_query",""), sep=sep, quotechar=quote_option)
+                data = stream_query_to_zip(sql_query, sep=sep, quotechar=quote_option)
+            
             st.download_button(
                 "📥 ダウンロード開始",
                 data=data,
@@ -342,20 +381,11 @@ def download_ready_ui(df_preview: pd.DataFrame, table_name: str, sql_all_func):
                 mime="application/zip",
                 key="fast_zip_dl"
             )
-    with colC:
-        st.caption("S3 アップロード")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("⤴ CSVをS3へ"):
-                S3_upload(st.session_state.get("last_query",""), DELIMITER_COMMA, "_data_CSV")
-        with c2:
-            if st.button("⤴ TSVをS3へ"):
-                S3_upload(st.session_state.get("last_query",""), DELIMITER_TAB, "_data_TSV")
 
 # -------------------------------------------------
 # SQL整形
 # -------------------------------------------------
-_LIMIT_PATTERN = re.compile(r"(?i)LIMIT\\s+\\d+")
+_LIMIT_PATTERN = re.compile(r"(?i)LIMIT\s+\d+")
 
 def remove_limit(sql: str) -> str:
     return _LIMIT_PATTERN.sub("", sql).strip()
@@ -365,44 +395,14 @@ def clean_sql(sql: str) -> str:
         return ""
     return sql.strip().rstrip(";")
 
-def get_full_data() -> pd.DataFrame:
-    sql = st.session_state.get("last_query", "")
+def get_full_data_builder() -> pd.DataFrame:
+    """SQLビルダーのセッションから全件取得"""
+    sql = st.session_state.get("builder_sql", "")
     if not sql:
         st.warning("実行対象のSQLがありません。")
         return pd.DataFrame()
     sql_full = clean_sql(remove_limit(sql))
     return run_query(sql_full)
-
-# -------------------------------------------------
-# SQL保存
-# -------------------------------------------------
-def save_sql_to_log(user: str, sql_text: str, sql_name: str):
-    """
-    SQLを {TARGETS[0]} の SQL_LOG に保存。将来は格納先も可変にできます。
-    """
-    if not sql_name or not sql_name.strip():
-        st.warning("保存名を入力してください。")
-        return
-    target_db = sanitize_ident(TARGETS[0]["db"])
-    target_schema = sanitize_ident(TARGETS[0]["schema"])
-    try:
-        sql_to_save = sql_text.replace("'", "''")
-        name_to_save = sql_name.replace("'", "''")
-        insert_sql = f"""
-INSERT INTO {target_db}.{target_schema}.sql_log (user_ID, sql_name, exec_query, save_date)
-VALUES ('{user}', '{name_to_save}', '{sql_to_save}', CURRENT_TIMESTAMP)
-"""
-        with get_conn().cursor() as cur:
-            cur.execute(insert_sql)
-            get_conn().commit()
-        st.session_state["sql_saved_message"] = f"SQLを保存しました！（{sql_name}）"
-    except Exception as e:
-        st.session_state["sql_saved_message"] = f"保存に失敗しました: {e}"
-
-def show_sql_save_message():
-    if "sql_saved_message" in st.session_state:
-        st.success(st.session_state["sql_saved_message"])
-        del st.session_state["sql_saved_message"]
 
 # -------------------------------------------------
 # 画面上部：ヘッダ / コマンドバー / タブ
@@ -422,239 +422,92 @@ target_schema = sanitize_ident(TARGETS[0]["schema"])
 # 権限ベースの候補一覧
 all_tables = get_allowed_tables()
 
-cb_left, cb_mid, cb_right = st.columns([1.2, 2.4, 2])
-with cb_left:
-    st.markdown(f"**対象**: `{target_db}.{target_schema}`")
-with cb_mid:
-    selected_table = st.selectbox("テーブル/ビューを選択", all_tables, index=0 if all_tables else None, placeholder="選択してください")
-with cb_right:
-    col_exec, col_save, col_dl = st.columns([1, 1, 1])
-    with col_exec:
-        exec_clicked = st.button("実行 ▶", type="primary", help="直近の設定でプレビューを再実行")
-    with col_save:
-        save_clicked = st.button("💾 保存")
-    with col_dl:
-        dl_clicked = st.button("📥 DL準備")
+# コマンドバーは対象表示のみに簡素化
+st.markdown(f"**対象**: `{target_db}.{target_schema}`")
 
 st.markdown("<hr/>", unsafe_allow_html=True)
-tabs = st.tabs(["① プレビュー & フィルタ", "② 複数テーブル結合", "③ 保存したSQL", "④ メタ情報"])
+tabs = st.tabs(["① SQLビルダー (フィルタ & 結合)", "② メタ情報"])
+
 
 # -------------------------------------------------
-# ① プレビュー & フィルタ タブ
+# ① SQLビルダー タブ
 # -------------------------------------------------
 with tabs[0]:
-    if not selected_table:
-        st.info("上のコマンドバーでテーブル／ビューを選んでください。")
-    else:
-        left, right = st.columns([1, 1.6])
+    st.subheader("SQLビルダー")
+    
+    # -----------------
+    # Step 1: テーブル定義 (FROM / JOIN)
+    # -----------------
+    st.markdown("#### Step 1: テーブル定義 (FROM / JOIN)")
+    
+    # ベーステーブル
+    base_table_options = [""] + all_tables
+    try:
+        base_table_index = base_table_options.index(st.session_state.builder_base_table)
+    except ValueError:
+        base_table_index = 0
+        
+    base_table = st.selectbox(
+        "主テーブル/ビュー",
+        base_table_options,
+        index=base_table_index,
+        key="builder_base_table_select" # st.session_state.builder_base_table と連動させる
+    )
+    if base_table != st.session_state.builder_base_table:
+        st.session_state.builder_base_table = base_table
+        st.session_state.builder_join_steps = [] # ベース変更でリセット
+        st.session_state.builder_available_columns = []
+        st.rerun()
 
-        # カラム情報
-        tname = sanitize_ident(selected_table)
-        df_columns = run_query(f"""
-            SELECT COLUMN_NAME, DATA_TYPE, COMMENT
-            FROM {target_db}.INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{tname}'
-            ORDER BY ORDINAL_POSITION
-        """)
-        columns = df_columns["COLUMN_NAME"].tolist()
+    # 結合ステップ
+    c_add, c_clear = st.columns(2)
+    with c_add:
+        if st.button("＋ 結合ステップを追加"):
+            st.session_state.builder_join_steps.append({
+                "right_table": "",
+                "left_key": [],
+                "right_key": [],
+                "how": "INNER"
+            })
+    with c_clear:
+        if st.button("🧹 結合ステップをクリア"):
+            st.session_state.builder_join_steps = []
+            st.rerun()
 
-        with left:
-            st.subheader("設定")
-            with st.form(key="filter_form", clear_on_submit=False):
-                default_cols = st.session_state.get("selected_columns", columns[: min(5, len(columns))])
-                selected_columns = st.multiselect("表示するカラム", columns, default=default_cols)
+    # 結合ステップUI
+    remove_index = None
+    all_join_tables_valid = True
+    
+    # カラム取得関数（キャッシュ活用）
+    @st.cache_data(ttl=300)
+    def get_cols(tbl_name):
+        if not tbl_name: return []
+        cols_data = get_columns_for_table(target_db, target_schema, tbl_name)
+        return [c["COLUMN_NAME"] for c in cols_data]
 
-                # 基本フィルタ（簡易）
-                st.markdown("**基本フィルタ（部分一致）**")
-                basic_filters = []
-                for col in selected_columns:
-                    val = st.text_input(f"{col}", key=f"like_{col}")
-                    if val.strip():
-                        basic_filters.append(f'"{col}" LIKE \'%{val.strip()}%\'')
+    current_left_table = st.session_state.builder_base_table
+    
+    for i, step in enumerate(st.session_state.builder_join_steps):
+        with st.container(border=True):
+            # (修正) ヘッダー行にタイトルと削除ボタンを配置
+            col_title, col_del_btn = st.columns([1, 0.1])
+            with col_title:
+                st.markdown(f"**Join Step {i+1}**")
+            with col_del_btn:
+                if st.button("✕", key=f"rm_{i}", help="このステップを削除"):
+                    remove_index = i
 
-                # 詳細フィルタ（折りたたみ）
-                with st.expander("詳細条件（数値・日付など）", expanded=False):
-                    adv_filters = []
-                    for col in selected_columns:
-                        dtype = df_columns.loc[df_columns["COLUMN_NAME"] == col, "DATA_TYPE"].iloc[0].upper()
-                        if any(t in dtype for t in ["NUMBER", "INT", "FLOAT", "DECIMAL", "DOUBLE"]):
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                minv = st.text_input(f"{col} 最小値", key=f"min_{col}")
-                            with c2:
-                                maxv = st.text_input(f"{col} 最大値", key=f"max_{col}")
-                            if minv.strip(): adv_filters.append(f'"{col}" >= {minv.strip()}')
-                            if maxv.strip(): adv_filters.append(f'"{col}" <= {maxv.strip()}')
-                        elif "DATE" in dtype or "TIME" in dtype:
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                date_from = st.date_input(f"{col} 以降", value=None, key=f"from_{col}")
-                            with c2:
-                                date_to = st.date_input(f"{col} 以前", value=None, key=f"to_{col}")
-                            if date_from: adv_filters.append(f'"{col}" >= \'{date_from}\'')
-                            if date_to:   adv_filters.append(f'"{col}" <= \'{date_to}\'')
-
-                submitted = st.form_submit_button("適用（プレビュー100件）", type="primary")
-                if submitted:
-                    st.session_state.selected_columns = selected_columns
-                    clauses = basic_filters + adv_filters
-                    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-                    quoted_cols = [f'"{c}"' for c in selected_columns] if selected_columns else ['*']
-                    fq_table = f"{target_db}.{target_schema}.{tname}"
-                    sql = f'SELECT {", ".join(quoted_cols)} FROM {fq_table} {where_sql} LIMIT 100'
-                    try:
-                        df = run_query(sql)
-                        st.session_state.df = df
-                        st.session_state.last_query = f'SELECT {", ".join(quoted_cols)} FROM {fq_table} {where_sql}'
-                        st.success(f"プレビュー {len(df)} 件を取得しました。")
-                    except Exception as e:
-                        st.error("取得に失敗しました。")
-                        st.write(e)
-
-        with right:
-            st.subheader("結果")
-            if exec_clicked:
-                # 直近のlast_queryがあれば再実行（LIMIT 100）
-                if st.session_state.get("last_query"):
-                    try:
-                        df = run_query(st.session_state["last_query"] + " LIMIT 100")
-                        st.session_state.df = df
-                        st.success("再実行しました。")
-                    except Exception as e:
-                        st.error("再実行に失敗しました。")
-                        st.write(e)
-                else:
-                    st.warning("実行可能なクエリがありません。左側で条件を設定して適用してください。")
-
-            if st.session_state.get("last_query"):
-                st.markdown("**実行されたSQL（プレビュー用）**")
-                st.code(st.session_state["last_query"] + " LIMIT 100", language="sql")
-
-            if isinstance(st.session_state.get("df"), pd.DataFrame) and not st.session_state.df.empty:
-                st.dataframe(st.session_state.df.head(50), use_container_width=True)
-
-                # 件数チェック
-                with st.container():
-                    show_count = st.checkbox("件数を計算する（フィルタ後）", value=False)
-                    if show_count:
-                        # last_query から FROM ... WHERE ... をそのまま使う
-                        from_where = st.session_state["last_query"].split("FROM", 1)[1]
-                        cnt_sql = "SELECT COUNT(*) AS cnt FROM " + from_where
-                        try:
-                            total = run_query(cnt_sql).iloc[0, 0]
-                            st.markdown(f"<span class='badge badge-run'>件数: {total} 件</span>", unsafe_allow_html=True)
-                        except Exception as e:
-                            st.warning("件数計算に失敗しました。")
-                            st.write(e)
-
-                # ダウンロード準備・S3・高速ZIP
-                def get_full_table():
-                    sql = st.session_state.get("last_query", "")
-                    return run_query(sql) if sql else pd.DataFrame()
-                if dl_clicked:
-                    with st.spinner("全件データを取得中..."):
-                        st.session_state.df_for_download = get_full_table()
-                    st.success(f"全件 {len(st.session_state.df_for_download)} 件を取得しました。")
-                download_ready_ui(st.session_state.df, selected_table, get_full_table)
-
-            # 保存（名前入力）
-            if save_clicked:
-                st.info("このSQLを保存します。保存名を入力して「保存実行」を押してください。")
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    save_name = st.text_input("保存名", key="save_sql_name_ui")
-                with c2:
-                    if st.button("保存実行"):
-                        if st.session_state.get("last_query"):
-                            save_sql_to_log(current_user, st.session_state["last_query"], save_name)
-                        else:
-                            st.warning("保存対象のSQLがありません。")
-                show_sql_save_message()
-
-# -------------------------------------------------
-# ② 複数テーブル結合 タブ
-# -------------------------------------------------
-with tabs[1]:
-    st.subheader("複数テーブル結合プレビュー")
-
-    # セッション状態
-    if "chain_base_table" not in st.session_state:
-        st.session_state.chain_base_table = selected_table if selected_table else ""
-    if "chain_steps" not in st.session_state:
-        st.session_state.chain_steps = []
-    if "chain_preview" not in st.session_state:
-        st.session_state.chain_preview = None
-    if "chain_total_count" not in st.session_state:
-        st.session_state.chain_total_count = None
-    if "chain_sql" not in st.session_state:
-        st.session_state.chain_sql = None
-    if "chain_download_ready" not in st.session_state:
-        st.session_state.chain_download_ready = False
-    if "chain_df_for_download" not in st.session_state:
-        st.session_state.chain_df_for_download = None
-
-    uiL, uiR = st.columns([1, 1.6])
-
-    with uiL:
-        base_table = st.selectbox(
-            "主テーブル/ビュー",
-            [""] + all_tables,
-            index=([""] + all_tables).index(st.session_state.chain_base_table)
-                  if st.session_state.chain_base_table in ([""] + all_tables) else 0
-        )
-        if base_table != st.session_state.chain_base_table:
-            st.session_state.chain_base_table = base_table
-            st.session_state.chain_preview = None
-            st.session_state.chain_total_count = None
-            st.session_state.chain_sql = None
-            st.session_state.chain_download_ready = False
-
-        select_all_cols = st.checkbox("プレビューで全列を表示（遅くなります）", value=False)
-
-        c_add, c_clear = st.columns(2)
-        with c_add:
-            if st.button("＋ 結合ステップを追加"):
-                st.session_state.chain_steps.append({
-                    "right_table": "",
-                    "left_key": [],
-                    "right_key": [],
-                    "how": "INNER"
-                })
-                st.session_state.chain_preview = None
-                st.session_state.chain_total_count = None
-                st.session_state.chain_sql = None
-                st.session_state.chain_download_ready = False
-        with c_clear:
-            if st.button("🧹 すべてクリア"):
-                st.session_state.chain_steps = []
-                st.session_state.chain_preview = None
-                st.session_state.chain_total_count = None
-                st.session_state.chain_sql = None
-                st.session_state.chain_download_ready = False
-
-        # ステップ設定
-        remove_index = None
-        for i, step in enumerate(st.session_state.chain_steps):
-            st.markdown(f"**Step {i+1}**")
-            lt = base_table if i == 0 else st.session_state.chain_steps[i-1]["right_table"]
-
-            # キー候補
-            def cols_of(tbl):
-                if not tbl:
-                    return []
-                dfc = run_query(f"""
-                    SELECT COLUMN_NAME
-                    FROM {target_db}.INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{sanitize_ident(tbl)}'
-                    ORDER BY ORDINAL_POSITION
-                """)
-                return dfc["COLUMN_NAME"].tolist()
-
-            left_cols = cols_of(lt)
-            options = [""] + [t for t in all_tables if t != lt] if lt else [""] + all_tables
+            left_cols = get_cols(current_left_table)
+            options = [""] + [t for t in all_tables if t != current_left_table] if current_left_table else [""] + all_tables
+            
+            try:
+                rt_index = options.index(step.get("right_table",""))
+            except ValueError:
+                rt_index = 0
+            
             step["right_table"] = st.selectbox(
                 f"結合先テーブル/ビュー (Step {i+1})", options,
-                index=options.index(step.get("right_table","")) if step.get("right_table","") in options else 0,
+                index=rt_index,
                 key=f"rt_{i}"
             )
             step["how"] = st.selectbox(
@@ -663,229 +516,369 @@ with tabs[1]:
                 key=f"how_{i}"
             )
 
-            right_cols = cols_of(step["right_table"])
-            c1, c2, c3 = st.columns([1, 1, .3])
+            right_cols = get_cols(step["right_table"])
+            
+            # (修正) 削除ボタンをヘッダーに移動したため、キー入力エリアのレイアウト変更
+            c1, c2 = st.columns(2) 
             with c1:
-                step["left_key"] = st.multiselect(f"左キー（{lt or '未選択'}）", left_cols, default=step.get("left_key", []), key=f"lk_{i}")
+                step["left_key"] = st.multiselect(f"左キー（{current_left_table or '未選択'}）", left_cols, default=step.get("left_key", []), key=f"lk_{i}")
             with c2:
                 step["right_key"] = st.multiselect(f"右キー（{step['right_table'] or '未選択'}）", right_cols, default=step.get("right_key", []), key=f"rk_{i}")
-            with c3:
-                if st.button("削除", key=f"rm_{i}"):
-                    remove_index = i
 
             if step["left_key"] and step["right_key"] and len(step["left_key"]) != len(step["right_key"]):
                 st.warning("⚠ 左右のキー数が一致していません。")
+            
+            if not step["right_table"] or not step["left_key"] or not step["right_key"]:
+                all_join_tables_valid = False
 
-        if remove_index is not None:
-            st.session_state.chain_steps.pop(remove_index)
-            st.session_state.chain_preview = None
-            st.session_state.chain_total_count = None
-            st.session_state.chain_sql = None
-            st.session_state.chain_download_ready = False
+            current_left_table = step["right_table"] # 次のステップの左側は、今のステップの右側
 
-        def build_from_clause(base: str, steps: list) -> str | None:
-            if not base:
-                return None
-            clause = f'{target_db}.{target_schema}.{sanitize_ident(base)}'
-            current_left = sanitize_ident(base)
-            for s in steps:
-                rt = sanitize_ident(s["right_table"]) if s["right_table"] else ""
-                lks = s["left_key"]
-                rks = s["right_key"]
-                how = s["how"]
-                if not (rt and lks and rks and how and len(lks)==len(rks)):
-                    return None
-                on_clause = " AND ".join([f'{current_left}."{lk}" = {rt}."{rk}"' for lk, rk in zip(lks, rks)])
-                clause += f' {how} JOIN {target_db}.{target_schema}.{rt} ON {on_clause}'
-                current_left = rt
-            return clause
+    if remove_index is not None:
+        st.session_state.builder_join_steps.pop(remove_index)
+        st.rerun()
 
-        def build_select_clause(base: str, steps: list) -> str:
-            tables = [sanitize_ident(base)] + [sanitize_ident(s["right_table"]) for s in steps if s["right_table"]]
-            select_cols = []
-            for t in tables:
-                dfc = run_query(f"""
-                    SELECT COLUMN_NAME
-                    FROM {target_db}.INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{t}'
-                    ORDER BY ORDINAL_POSITION
-                """)
-                cols = dfc["COLUMN_NAME"].tolist()
-                if not select_all_cols:
-                    cols = cols[:20]
-                for c in cols:
-                    select_cols.append(f'{t}."{c}" AS "{t}_{c}"')
-            return ", ".join(select_cols)
+    # -----------------
+    # Step 2: 条件指定 (WHERE / SELECT)
+    # -----------------
+    st.markdown("#### Step 2: 条件指定 (WHERE / SELECT)")
 
-        if st.button("データを取得して表示（プレビュー100件）"):
-            from_clause = build_from_clause(st.session_state.chain_base_table, st.session_state.chain_steps)
-            if not from_clause:
-                st.error("未設定のステップ（テーブル/キー/方法）があります。")
-            else:
-                select_clause = build_select_clause(st.session_state.chain_base_table, st.session_state.chain_steps)
-                sql = f"SELECT {select_clause} FROM {from_clause}"
-                try:
-                    df_preview = run_query(sql + " LIMIT 100")
-                    cnt = run_query(f"SELECT COUNT(*) AS cnt FROM {from_clause}").iloc[0, 0]
-                    st.session_state.chain_sql = sql
-                    st.session_state.chain_preview = df_preview
-                    st.session_state.chain_total_count = cnt
-                    st.session_state.chain_download_ready = True
-                    st.session_state.show_save_ui = True
-                except Exception as e:
-                    st.error("SQL実行でエラーが発生しました。")
-                    st.write(e)
-                    st.session_state.chain_download_ready = False
+    # Step 1 の定義から利用可能なカラム一覧を生成
+    if st.button("テーブル定義を確定（Step 2 のカラムを更新）"):
+        st.session_state.builder_available_columns = []
+        st.session_state.builder_where_conditions = [] # 動的UI用リセット
+        st.session_state.builder_where_next_id = 0 # 動的UI用リセット
+        st.session_state.builder_selected_columns = []
+        
+        tables_in_use = {} # 重複テーブルにエイリアスを付与
+        
+        def add_cols(tbl_name, alias):
+            cols_data = get_columns_for_table(target_db, target_schema, tbl_name)
+            for c in cols_data:
+                st.session_state.builder_available_columns.append({
+                    "fq_name": f"{alias}.{c['COLUMN_NAME']}",
+                    "table_alias": alias,
+                    "table_name": tbl_name,
+                    "column": c['COLUMN_NAME'],
+                    "dtype": c['DATA_TYPE'].upper()
+                })
 
-    with uiR:
-        if st.session_state.get("chain_sql"):
-            st.markdown("**実行されたSQL**")
-            st.code(st.session_state.chain_sql, language="sql")
-        if st.session_state.get("chain_preview") is not None:
-            st.dataframe(st.session_state.chain_preview, use_container_width=True)
-            st.markdown(f"<span class='badge badge-run'>全件数: {st.session_state.chain_total_count} 件</span>", unsafe_allow_html=True)
+        if st.session_state.builder_base_table:
+            base_alias = sanitize_ident(st.session_state.builder_base_table)
+            tables_in_use[base_alias] = 1
+            add_cols(st.session_state.builder_base_table, base_alias)
 
-            # DL準備（全件）/ 高速ZIP / S3
-            cA, cB = st.columns([1.2, 1])
-            with cA:
-                if st.button("📥 ダウンロード準備（全件取得）", key="chain_full"):
-                    with st.spinner("全件データを取得中..."):
-                        df_all = run_query(st.session_state.chain_sql)
-                        st.session_state.chain_df_for_download = df_all
-                    st.success(f"全件データを取得しました ({len(st.session_state.chain_df_for_download)}件)")
-            with cB:
-                # 高速ZIP
-                sep_choice = st.radio("区切り", ["CSV", "TSV"], horizontal=True, key="chain_sep")
-                sep = "\t" if sep_choice == "TSV" else ","
-                quote_option = st.selectbox("囲い文字", ['"', "'"], index=0, key="chain_quote")
-                if st.button("📥 高速ZIPダウンロード", key="chain_zip"):
-                    data = stream_query_to_zip(st.session_state.chain_sql, sep=sep, quotechar=quote_option)
-                    st.download_button(
-                        "📥 ダウンロード開始",
-                        data=data,
-                        file_name=f"{st.session_state.chain_base_table}_{datetime.date.today():%Y%m%d}_server.zip",
-                        mime="application/zip",
-                        key="chain_zip_dl"
+        for step in st.session_state.builder_join_steps:
+            if step["right_table"]:
+                alias = sanitize_ident(step["right_table"])
+                if alias in tables_in_use:
+                    tables_in_use[alias] += 1
+                    alias = f"{alias}_{tables_in_use[alias]}" # TBL_2
+                else:
+                    tables_in_use[alias] = 1
+                add_cols(step["right_table"], alias)
+        
+        st.success(f"{len(st.session_state.builder_available_columns)} 件のカラムを読込みました。")
+
+    if st.session_state.builder_available_columns:
+        
+        # --- フィルタ (WHERE) ---
+        # st.form の外で動的に管理
+        with st.expander("フィルタ条件 (WHERE)", expanded=True):
+            all_cols_fq_names = [c["fq_name"] for c in st.session_state.builder_available_columns]
+            
+            # 条件追加ボタン
+            if st.button("＋ フィルタ条件を追加"):
+                new_id = st.session_state.builder_where_next_id
+                st.session_state.builder_where_conditions.append({
+                    "id": new_id,
+                    "column": all_cols_fq_names[0] if all_cols_fq_names else "",
+                    "operator": "LIKE",
+                    "value": ""
+                })
+                st.session_state.builder_where_next_id += 1
+                st.rerun()
+
+            # 既存の条件をループ表示
+            indices_to_remove = []
+            for i, condition in enumerate(st.session_state.builder_where_conditions):
+                # ユニークキーのため id を使用
+                condition_id = condition["id"]
+                
+                # (修正) フォームを横並びに
+                c1, c2, c3, c4 = st.columns([3, 2, 3, 1])
+                
+                # 1. カラム選択
+                with c1:
+                    try:
+                        col_index = all_cols_fq_names.index(condition["column"])
+                    except ValueError:
+                        col_index = 0
+                    condition["column"] = st.selectbox(
+                        "カラム",
+                        all_cols_fq_names, 
+                        index=col_index, 
+                        key=f"where_col_{condition_id}",
+                        label_visibility="collapsed"
                     )
-            # S3
-            cS1, cS2 = st.columns(2)
-            with cS1:
-                if st.button("⤴ S3アップロード(CSV)", key="chain_s3_csv"):
-                    S3_upload(st.session_state.chain_sql, DELIMITER_COMMA, "_join_CSV")
-            with cS2:
-                if st.button("⤴ S3アップロード(TSV)", key="chain_s3_tsv"):
-                    S3_upload(st.session_state.chain_sql, DELIMITER_TAB, "_join_TSV")
+                
+                # 2. 演算子選択
+                with c2:
+                    operators = ["LIKE", "=", "!=", ">", ">=", "<", "<=", "IS NULL", "IS NOT NULL"]
+                    try:
+                        op_index = operators.index(condition["operator"])
+                    except ValueError:
+                        op_index = 0
+                    condition["operator"] = st.selectbox(
+                        "演算子",
+                        operators, 
+                        index=op_index, 
+                        key=f"where_op_{condition_id}",
+                        label_visibility="collapsed"
+                    )
 
-            # DL（DF準備済み）
-            if st.session_state.get("chain_df_for_download") is not None and not st.session_state.chain_df_for_download.empty:
-                show_download_ui(
-                    st.session_state.chain_df_for_download,
-                    table_name="_".join([st.session_state.chain_base_table] + [s["right_table"] for s in st.session_state.chain_steps if s["right_table"]]),
-                    key_prefix="chain_dl"
+                # 3. 値入力
+                is_null_op = condition["operator"] in ["IS NULL", "IS NOT NULL"]
+                with c3:
+                    condition["value"] = st.text_input(
+                        "値",
+                        value=condition["value"], 
+                        key=f"where_val_{condition_id}",
+                        disabled=is_null_op,
+                        placeholder="値 (IS NULL/NOT NULL は空欄)",
+                        label_visibility="collapsed"
+                    )
+
+                # 4. 削除ボタン
+                with c4:
+                    if st.button("削除", key=f"where_del_{condition_id}"):
+                        indices_to_remove.append(i)
+
+
+            # 削除処理（ループの外で実行）
+            if indices_to_remove:
+                # 後ろのインデックスから削除する
+                for index in sorted(indices_to_remove, reverse=True):
+                    st.session_state.builder_where_conditions.pop(index)
+                st.rerun()
+
+
+        # --- フォーム (SELECT と 実行) ---
+        with st.form(key="select_form", clear_on_submit=False):
+            
+            # --- 表示カラム (SELECT) ---
+            # (修正) st.expander で囲む
+            with st.expander("表示カラム (SELECT)", expanded=True):
+                default_cols = st.session_state.builder_selected_columns or [c["fq_name"] for c in st.session_state.builder_available_columns]
+                selected_columns = st.multiselect(
+                    "表示するカラムを選択", 
+                    [c["fq_name"] for c in st.session_state.builder_available_columns], 
+                    default=default_cols,
+                    key="builder_select_multiselect",
+                    label_visibility="collapsed" # ラベルを非表示
                 )
+                st.session_state.builder_selected_columns = selected_columns
 
-        # SQL保存
-        if st.session_state.get("chain_sql"):
-            with st.expander("💾 このSQLを保存", expanded=False):
-                save_name = st.text_input("保存名", key="save_chain_sql_name")
-                if st.button("保存実行", key="save_chain_sql_btn"):
-                    save_sql_to_log(current_user, st.session_state.chain_sql, save_name)
-                show_sql_save_message()
-
-# -------------------------------------------------
-# ③ 保存したSQL タブ
-# -------------------------------------------------
-with tabs[2]:
-    st.subheader("保存したSQLの再実行")
-    df_sql_log = run_query(f"""
-SELECT "LOG_ID", "SQL_NAME", "EXEC_QUERY", "SAVE_DATE"
-FROM {target_db}.{target_schema}.SQL_LOG
-WHERE "USER_ID" = '{current_user}'
-ORDER BY "SAVE_DATE" DESC
-""")
-    if df_sql_log.empty:
-        st.info("まだ保存されたSQLはありません。")
-    else:
-        selected_id = st.selectbox(
-            "再実行したいSQLを選択",
-            options=df_sql_log["LOG_ID"],
-            format_func=lambda x: f"{df_sql_log.loc[df_sql_log['LOG_ID']==x, 'SQL_NAME'].values[0]} ({df_sql_log.loc[df_sql_log['LOG_ID']==x, 'SAVE_DATE'].values[0]})"
-        )
-        if st.session_state.get("last_selected_id") != selected_id:
-            st.session_state.df_preview = None
-            st.session_state.df_for_download = None
-            st.session_state.last_selected_id = selected_id
-
-        selected_sql = df_sql_log.loc[df_sql_log["LOG_ID"] == selected_id, "EXEC_QUERY"].values[0]
-        cleaned_sql = clean_sql(selected_sql)
-        preview_sql = cleaned_sql
-        if not re.search(r"(?i)LIMIT\\s+\\d+", selected_sql):
-            preview_sql += " LIMIT 100"
-
-        st.markdown("**SQLプレビュー**")
-        st.code(preview_sql, language="sql")
-
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            if st.button("このSQLを実行（プレビュー100件）"):
+            # --- 実行 ---
+            submitted = st.form_submit_button("適用（プレビュー100件）", type="primary")
+            if submitted:
+                # SQLを構築
                 try:
-                    df_preview = run_query(preview_sql)
-                    st.session_state.df_preview = df_preview
-                    st.success(f"プレビュー取得完了 ({len(df_preview)}件)")
-                    st.session_state.last_query = cleaned_sql  # LIMITなしを保持
+                    # SELECT句
+                    if not st.session_state.builder_selected_columns:
+                        st.error("表示カラムを1つ以上選択してください。")
+                    else:
+                        select_cols = [f'"{c["table_alias"]}"."{c["column"]}" AS "{c["fq_name"]}"' 
+                                       for c in st.session_state.builder_available_columns 
+                                       if c["fq_name"] in st.session_state.builder_selected_columns]
+                        select_sql = f"SELECT {', '.join(select_cols)}"
+
+                        # FROM / JOIN句
+                        from_sql = ""
+                        tables_in_use = {} # エイリアス管理
+                        fq_db_schema = f"{target_db}.{target_schema}"
+
+                        def get_alias(tbl_name):
+                            alias = sanitize_ident(tbl_name)
+                            if alias in tables_in_use:
+                                tables_in_use[alias] += 1
+                                alias = f"{alias}_{tables_in_use[alias]}"
+                            else:
+                                tables_in_use[alias] = 1
+                            return alias
+
+                        base_table = st.session_state.builder_base_table
+                        if not base_table:
+                            raise ValueError("主テーブルが選択されていません。")
+                        
+                        base_alias = get_alias(base_table)
+                        from_sql = f'FROM {fq_db_schema}."{base_table}" AS "{base_alias}"'
+                        
+                        current_left_alias = base_alias
+
+                        for step in st.session_state.builder_join_steps:
+                            if not (step["right_table"] and step["left_key"] and step["right_key"] and len(step["left_key"]) == len(step["right_key"])):
+                                raise ValueError("結合ステップの設定が不完全です。")
+                            
+                            right_alias = get_alias(step["right_table"])
+                            how = step["how"]
+                            
+                            on_clauses = []
+                            for lk, rk in zip(step["left_key"], step["right_key"]):
+                                on_clauses.append(f'"{current_left_alias}"."{lk}" = "{right_alias}"."{rk}"')
+                            on_sql = " AND ".join(on_clauses)
+                            
+                            from_sql += f' {how} JOIN {fq_db_schema}."{step["right_table"]}" AS "{right_alias}" ON {on_sql}'
+                            
+                            current_left_alias = right_alias # 連結
+
+                        # WHERE句
+                        where_clauses = []
+                        
+                        # (変更) builder_where_conditions から構築
+                        for condition in st.session_state.builder_where_conditions:
+                            col_fq_name = condition["column"]
+                            operator = condition["operator"]
+                            value = condition["value"]
+
+                            col_info = next((c for c in st.session_state.builder_available_columns if c["fq_name"] == col_fq_name), None)
+                            if not col_info: continue
+                            
+                            col_sql = f'"{col_info["table_alias"]}"."{col_info["column"]}"'
+                            col_dtype = col_info["dtype"]
+
+                            # IS NULL / IS NOT NULL
+                            if operator in ["IS NULL", "IS NOT NULL"]:
+                                where_clauses.append(f"{col_sql} {operator}")
+                                continue
+
+                            # 値が空の場合はスキップ
+                            if not value:
+                                continue
+
+                            # 演算子と型に応じて句を構築
+                            if operator == "LIKE":
+                                where_clauses.append(f"{col_sql} LIKE '%{value}%'")
+                            else:
+                                # 数値型か？
+                                is_numeric_type = any(t in col_dtype for t in ["NUMBER", "INT", "FLOAT", "DECIMAL", "DOUBLE"])
+                                if is_numeric_type:
+                                    # 値が数値として妥当か（簡易チェック）
+                                    if re.fullmatch(r"-?\d+(\.\d+)?", value):
+                                        where_clauses.append(f"{col_sql} {operator} {value}")
+                                    else:
+                                        st.warning(f"警告: カラム {col_fq_name} の値 '{value}' は数値として無効なためスキップされました。")
+                                else:
+                                    # 文字列・日付・時刻型は ' で囲む
+                                    # (注: Snowflakeは日付や時刻も ' で囲む)
+                                    value_escaped = value.replace("'", "''") # シングルクォートをエスケープ
+                                    where_clauses.append(f"{col_sql} {operator} '{value_escaped}'")
+                        
+                        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+                        
+                        # SQL結合
+                        final_sql = f"{select_sql} {from_sql} {where_sql}"
+                        st.session_state.builder_sql = final_sql
+                        
+                        # 実行
+                        df_preview = run_query(final_sql + " LIMIT 100")
+                        st.session_state.builder_df_preview = df_preview
+                        st.session_state.builder_df_for_download = pd.DataFrame() # プレビュー実行でリセット
+                        st.success(f"プレビュー {len(df_preview)} 件を取得しました。")
+
                 except Exception as e:
-                    st.error(f"プレビュー取得に失敗しました: {e}")
+                    st.error(f"SQLの構築または実行に失敗しました: {e}")
+                    st.session_state.builder_sql = ""
+                    st.session_state.builder_df_preview = pd.DataFrame()
 
-        if st.session_state.get("df_preview") is not None:
-            st.dataframe(st.session_state.df_preview, use_container_width=True)
+    # -----------------
+    # Step 3: 結果表示
+    # -----------------
+    st.markdown("#### Step 3: 結果表示")
+    
+    if st.session_state.builder_sql:
+        st.markdown("**実行されたSQL（プレビュー用）**")
+        st.code(st.session_state.builder_sql + " LIMIT 100", language="sql")
+    
+    if not st.session_state.builder_df_preview.empty:
+        st.dataframe(st.session_state.builder_df_preview.head(50), use_container_width=True)
 
-            # DL準備
-            def get_full_data_saved() -> pd.DataFrame:
-                sql = st.session_state.get("last_query", "")
-                if not sql:
-                    st.warning("実行対象のSQLがありません。")
-                    return pd.DataFrame()
-                sql_full = clean_sql(remove_limit(sql))
-                return run_query(sql_full)
+        # 件数チェック
+        with st.container():
+            show_count = st.checkbox("件数を計算する（フィルタ後）", value=False)
+            if show_count:
+                if st.session_state.builder_sql:
+                    # SELECT ... FROM ... -> SELECT COUNT(*) FROM ...
+                    from_where = st.session_state.builder_sql.split("FROM", 1)[1]
+                    cnt_sql = "SELECT COUNT(*) AS cnt FROM " + from_where
+                    try:
+                        total = run_query(cnt_sql).iloc[0, 0]
+                        st.markdown(f"<span class='badge badge-run'>件数: {total} 件</span>", unsafe_allow_html=True)
+                    except Exception as e:
+                        st.warning("件数計算に失敗しました。")
+                        st.write(e)
+                else:
+                    st.warning("件数計算の元となるSQLがありません。")
 
-            download_ready_ui(
-                df_preview=st.session_state.df_preview,
-                table_name=f"savedSQL_{selected_id}",
-                sql_all_func=get_full_data_saved
-            )
+        # ダウンロード準備
+        download_ready_ui(
+            df_preview=st.session_state.builder_df_preview,
+            table_name=st.session_state.builder_base_table or "query",
+            sql_all_func=get_full_data_builder,
+            sql_query=st.session_state.builder_sql
+        )
+    
+    elif st.session_state.builder_available_columns:
+        st.info("上記フォームで条件を指定し、「適用（プレビュー100件）」を押してください。")
+    else:
+        st.info("Step 1 でテーブルを定義し、「Step 2 のカラムを更新」を押してください。")
+
 
 # -------------------------------------------------
-# ④ メタ情報 タブ
+# ② メタ情報 タブ
 # -------------------------------------------------
-with tabs[3]:
+with tabs[1]:
     st.subheader("メタ情報")
-    if not selected_table:
-        st.info("コマンドバーでテーブル／ビューを選択してください。")
+    
+    # ユーザーにテーブルを選択させる
+    selected_table_meta = st.selectbox(
+        "メタ情報を表示するテーブル/ビューを選択", 
+        all_tables, 
+        index=0 if all_tables else None, 
+        placeholder="選択してください",
+        key="meta_table_select"
+    )
+
+    if not selected_table_meta:
+        st.info("テーブル／ビューを選択してください。")
     else:
         # テーブルコメント
         df_comment = run_query(f"""
             SELECT COMMENT
             FROM {target_db}.INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{sanitize_ident(selected_table)}'
+            WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{sanitize_ident(selected_table_meta)}'
         """)
         comment = df_comment.iloc[0,0] if (not df_comment.empty and df_comment.iloc[0,0]) else "(説明なし)"
         st.markdown(f"**テーブル説明:** {comment}")
 
         # カラム辞書（CODE_M）
         st.markdown("**カラム辞書（CODE_M）サンプル**")
-        df_cols = run_query(f"""
-            SELECT COLUMN_NAME, DATA_TYPE, COMMENT
-            FROM {target_db}.INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA='{target_schema}' AND TABLE_NAME='{sanitize_ident(selected_table)}'
-            ORDER BY ORDINAL_POSITION
-        """)
-        cols = df_cols["COLUMN_NAME"].tolist()
-        if cols:
-            col_list = "', '".join(cols)
+        
+        # カラム一覧取得
+        cols_data = get_columns_for_table(target_db, target_schema, selected_table_meta)
+        
+        if not cols_data:
+            st.warning("このテーブルのカラム情報を取得できませんでした。")
+        else:
+            # カラム一覧をDataFrameで表示
+            st.markdown(f"**{selected_table_meta} のカラム一覧**")
+            st.dataframe(pd.DataFrame(cols_data), use_container_width=True)
+
+            # CODE_M検索
+            cols_list_for_sql = "', '".join([c['COLUMN_NAME'] for c in cols_data])
             code_df = run_query(f"""
 SELECT "カラム名", "コード値", "コード値名称"
 FROM {target_db}.{target_schema}.CODE_M
-WHERE "カラム名" IN ('{col_list}')
+WHERE "カラム名" IN ('{cols_list_for_sql}')
 """)
             if code_df.empty:
                 st.caption("CODE_M に対応エントリはありません。")
